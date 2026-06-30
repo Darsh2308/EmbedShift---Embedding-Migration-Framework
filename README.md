@@ -1,8 +1,11 @@
 # Embedding Migration Framework
 
-Migrate to a new embedding model **without re-embedding your entire corpus**.
+Migrate to a new embedding model **without re-embedding your entire corpus** —
+*when the old and new models belong to the same family.*
+
 Re-embed a small sample, learn a cheap "mapper" that translates old vectors into the
-new model's space, verify quality before committing, then transform everything instantly.
+new model's space, verify quality with a confidence gate before committing, then
+transform everything instantly.
 
 - **What & why:** see [Info.md](Info.md)
 - **Roadmap:** see [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md)
@@ -10,6 +13,89 @@ new model's space, verify quality before committing, then transform everything i
 - **Reading the report:** see [docs/CONFIDENCE_REPORT.md](docs/CONFIDENCE_REPORT.md)
 
 **Stack:** Python · FastAPI · NumPy
+
+---
+
+## Problem statement
+
+An embedding model is a translator: it turns each document into a vector, and search,
+recommendations, and RAG all work by comparing those vectors. **Every model places
+vectors in its own space** — different dimensions, different geometry — so a vector
+made by Model A is meaningless to Model B.
+
+The consequence: the moment you upgrade to a better model, **all your stored vectors
+become useless.** The only accepted fix today is to **re-embed the entire corpus** with
+the new model, which at scale (millions–billions of documents) is:
+
+- **Expensive** — large API/GPU bills.
+- **Slow** — long migration windows.
+- **Risky** — it requires the original source text, which many teams never kept.
+
+Because re-embedding is so painful, teams stay stuck on outdated models. **Can we switch
+models without paying to re-embed everything?**
+
+---
+
+## How we solve it
+
+Instead of re-translating every document, we **learn a small translator (the "mapper")**
+that converts old-model vectors into the new model's space:
+
+```
+f(old_vector) ≈ new_vector
+```
+
+The pipeline (`sample → train → gate → transform`):
+
+1. **Sample (1–5%).** Old vectors are already stored. Run *only the sample* through the
+   new model to build matched `(old, new)` pairs. The old model is never needed.
+2. **Train the mapper.** Fit a `LinearMapper` (SVD-based ridge regression with
+   mean-centering, cross-validated λ, dimension-mismatch support). Upgrades to a small
+   pure-NumPy `MLPMapper` only when linear underperforms on a held-out slice (`auto`).
+   Seconds on a laptop — no GPU.
+3. **Confidence gate.** On held-out queries, measure **recall@k** of the mapped index
+   against a full-re-embedding gold standard, and compare to the do-nothing baseline.
+   Report a single **quality-retained** number and a **pass/fail** verdict *before*
+   committing. (See [docs/CONFIDENCE_REPORT.md](docs/CONFIDENCE_REPORT.md).)
+4. **Transform.** Only if the gate passes, stream all old vectors through the mapper
+   (one matrix multiply each — instant, nearly free) and write them to a **new**
+   collection. The source is never touched, so rollback stays possible.
+
+Key correctness rule: **queries are embedded directly with the new model, never mapped.**
+The mapper only moves the stored corpus into the new space; queries already live there.
+
+---
+
+## Findings / Conclusion
+
+We validated the approach end-to-end (up to a 100k-vector corpus, file + live Qdrant
+backends) across model pairs. The result is sharp and worth stating plainly:
+
+> **The mapper works for migrations within the same model family. It does not work for
+> migrating across different model families.**
+
+- ✅ **Same family** (same architecture / training lineage, e.g. a size or version bump
+  within one provider's line). The two spaces are geometrically related, so a learned
+  linear (or small MLP) map bridges them well. The gate **passes** — typically ~90%+
+  quality retained — and you get most of the new model's quality for ~3–5% of the cost.
+
+- ❌ **Different families** (e.g. one provider's model → an unrelated provider's model).
+  The spaces encode fundamentally different geometry. No linear or small nonlinear map
+  reliably bridges them; **quality-retained falls below the gate threshold and the
+  migration fails the gate.**
+
+**Why this is a hard limit, not a tuning problem.** The mapper can only re-project
+information *already present* in the old vectors. A different-family model is different
+precisely because it captures distinctions the old model never encoded — and **no mapper
+can invent back information that was never there.** Larger MLPs and bigger samples shift
+the margin slightly but do not change the conclusion.
+
+**The confidence gate is therefore the product.** It detects the cross-family case
+automatically and **refuses the migration** rather than silently shipping a degraded
+index. When the gate fails, the only path to full quality is a real re-embedding.
+
+**Bottom line:** this is a *same-family migration accelerator* — honest, gated, and
+scalable — not a universal re-embedding eliminator.
 
 ---
 
@@ -116,8 +202,8 @@ app/
   main.py        # FastAPI entrypoint
   config.py      # env-based settings
   api/           # endpoints (routers)
-  core/          # mapper + evaluation (the math)   [Phase 2-3]
-  stores/        # VectorStore interface + adapters [Phase 1, 6]
+  core/          # mapper + evaluation (the math)
+  stores/        # VectorStore interface + adapters
   models/        # pydantic request/response schemas
   utils/         # logging, helpers
 tests/           # pytest suite
@@ -127,14 +213,16 @@ artifacts/       # trained mappers + reports (gitignored)
 
 ## Status
 
-- **Phase 0 — Project setup: complete.** Runnable FastAPI skeleton with `/health` and tests.
-- **Phase 1 — Data layer: complete.** `VectorStore` interface + `FileStore` (`.jsonl`/`.npz`/`.npy`), streaming reads, reproducible sampling, sample↔text pairing, write-back.
-- **Phase 2 — The mapper: complete.** `LinearMapper` (SVD-based ridge regression with mean-centering, optional L2-normalize, dimension-mismatch support), cross-validated λ selection, save/load artifacts, metrics (MSE/cosine).
-- **Phase 3 — Evaluation + confidence gate: complete.** recall@k harness (true-new gold standard, queries embedded with the new model), three-way comparison (ceiling / mapped / do-nothing), quality-retained, and a pass/fail confidence report (JSON + human-readable).
-- **Phase 4 — Transform pipeline: complete.** Resumable streaming full-corpus transform (checkpoint + byte-offset recovery) and the end-to-end orchestration `run_migration` (sample → train → gate → transform), gated by the confidence verdict. Verified on a 100k-vector corpus (~93% quality retained, transformed in seconds).
-- **Phase 5 — FastAPI endpoints: complete.** Stateful session API (`/connect`, `/sample`, `/train`, `/evaluate`, `/transform`), background transform jobs (`/jobs/{id}`), and a pluggable new-model embedder registry (`/embedders`). Full migration runs purely over HTTP.
-- **Phase 6 — Live vector DB connectors: complete.** `QdrantStore` (real connector, lazy `qdrant-client`) and `InMemoryVectorStore`, both behind the same `VectorStore` interface; store-to-store transform with idempotent write-back to a new collection; backend selection in `/connect`. Verified end-to-end against a local Qdrant (read `old` → map → write `corpus_v2`, 100% live recall).
-- **Phase 7 — Robustness + MLP mapper: complete.** Pure-NumPy `MLPMapper` (1–2 layers, Adam, weight decay, early stopping) and `auto` selection that fits linear first and upgrades to the MLP only when linear fails on a held-out selection slice. On a nonlinear model pair the upgrade lifted quality 63%→86% and flipped the gate fail→pass.
-- **Phase 8 — Packaging + deploy: complete.** Dockerfile + docker-compose (API + Qdrant), `emf` CLI, configuration & confidence-report docs, a self-contained example, and GitHub Actions CI (lint + tests).
-
 All phases complete. 🎉
+
+- **Phase 0 — Project setup.** Runnable FastAPI skeleton with `/health` and tests.
+- **Phase 1 — Data layer.** `VectorStore` interface + `FileStore` (`.jsonl`/`.npz`/`.npy`), streaming reads, reproducible sampling, sample↔text pairing, write-back.
+- **Phase 2 — The mapper.** `LinearMapper` (SVD-based ridge regression with mean-centering, optional L2-normalize, dimension-mismatch support), cross-validated λ selection, save/load artifacts, metrics (MSE/cosine).
+- **Phase 3 — Evaluation + confidence gate.** recall@k harness (true-new gold standard, queries embedded with the new model), three-way comparison (ceiling / mapped / do-nothing), quality-retained, and a pass/fail confidence report (JSON + human-readable).
+- **Phase 4 — Transform pipeline.** Resumable streaming full-corpus transform (checkpoint + byte-offset recovery) and the end-to-end orchestration `run_migration` (sample → train → gate → transform), gated by the confidence verdict. Verified on a 100k-vector corpus (~93% quality retained, same-family pair, transformed in seconds).
+- **Phase 5 — FastAPI endpoints.** Stateful session API (`/connect`, `/sample`, `/train`, `/evaluate`, `/transform`), background transform jobs (`/jobs/{id}`), and a pluggable new-model embedder registry (`/embedders`).
+- **Phase 6 — Live vector DB connectors.** `QdrantStore` and `InMemoryVectorStore` behind the same `VectorStore` interface; store-to-store transform with idempotent write-back to a new collection. Verified end-to-end against a local Qdrant.
+- **Phase 7 — Robustness + MLP mapper.** Pure-NumPy `MLPMapper` (1–2 layers, Adam, weight decay, early stopping) and `auto` selection that upgrades from linear only when linear fails on a held-out slice.
+- **Phase 8 — Packaging + deploy.** Dockerfile + docker-compose (API + Qdrant), `emf` CLI, configuration & confidence-report docs, a self-contained example, and GitHub Actions CI (lint + tests).
+</content>
+</invoke>
