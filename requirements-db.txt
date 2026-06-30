@@ -1,0 +1,9 @@
+# Optional vector-DB connectors + live-migration providers.
+# Install alongside requirements.txt:
+#   pip install -r requirements-db.txt
+
+qdrant-client>=1.7
+
+# Live migration test (Pinecone source/dest + Voyage new model)
+pinecone>=5
+voyageai>=0.3

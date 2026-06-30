@@ -1,0 +1,26 @@
+[project]
+name = "embedding-migration-framework"
+version = "0.1.0"
+description = "Migrate to a new embedding model without re-embedding the whole corpus."
+requires-python = ">=3.10"
+
+[project.scripts]
+emf = "app.cli:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Keep it to real-bug rules (syntax errors, undefined names) rather than style.
+select = ["E9", "F63", "F7", "F82", "F401", "F811"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    # Spurious FPE from NumPy 2.x + Apple Accelerate BLAS matmul (results are correct).
+    "ignore:.*encountered in matmul:RuntimeWarning",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]

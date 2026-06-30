@@ -1,0 +1,25 @@
+# Boots the migration API together with a Qdrant instance.
+#   docker compose up --build
+# API   -> http://localhost:8000  (docs at /docs)
+# Qdrant-> http://localhost:6333
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+    depends_on:
+      - qdrant
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  qdrant_data:

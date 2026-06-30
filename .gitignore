@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.*
+!.env.example
+.secrets.env
+*.secrets.env
+
+# Test / cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project data (vectors, artifacts)
+data/*
+!data/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
